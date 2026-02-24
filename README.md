@@ -86,7 +86,7 @@ I spent two days trying to get FP4 working through existing paths before writing
 | CUTLASS Example 79a | Works! But standalone binary, not a library |
 | vLLM / TensorRT-LLM | Require full serving stack, can't just call a GEMM |
 
-Important detail most people miss: **MXFP4 weights (E2M1 + E8M0 scales) can't be used directly on SM121 tensor cores.** SM121 uses NVFP4 with UE4M3 scale factors and a specific interleaved layout (`SfKMajorAtom`). Any MXFP4 model checkpoints need re-quantization before the hardware will accept them.
+One thing that tripped me up: **MXFP4 weights (E2M1 + E8M0 scales) can't be used directly on SM121 tensor cores.** SM121 uses NVFP4 with UE4M3 scale factors and a specific interleaved layout (`SfKMajorAtom`). Any MXFP4 model checkpoints need re-quantization before the hardware will accept them.
 
 ## How It Works
 
