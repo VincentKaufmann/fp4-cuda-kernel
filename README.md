@@ -62,7 +62,7 @@ BF16 Input B [N, K]  ──→  GPU Quantize Kernel  ──→  FP4 packed [N, K
 ## Build
 
 ```bash
-git clone --recursive https://github.com/vincentkoc/fp4-gemm-blackwell.git
+git clone --recursive https://github.com/VincentKaufmann/fp4-gemm-blackwell.git
 cd fp4-gemm-blackwell
 
 nvcc -arch=sm_121a -shared -Xcompiler -fPIC -O2 --expt-relaxed-constexpr \
@@ -133,7 +133,7 @@ If you find this useful, please cite:
   author = {Koc, Vincent},
   title = {FP4 GEMM Library for Blackwell SM120/SM121},
   year = {2026},
-  url = {https://github.com/vincentkoc/fp4-gemm-blackwell}
+  url = {https://github.com/VincentKaufmann/fp4-gemm-blackwell}
 }
 ```
 
