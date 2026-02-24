@@ -1,151 +1,175 @@
 # FP4 CUDA Kernel for NVIDIA Blackwell (DGX Spark / RTX 50 Series)
 
-Hardware FP4 tensor core GEMM for Blackwell SM120/SM121, built on CUTLASS 3.8.
+Hardware FP4 tensor core acceleration for Blackwell SM120/SM121, built on CUTLASS 3.8.
 
-**5-9x faster than float32** at real model dimensions, with 0.991 Pearson correlation accuracy. Unlocks hardware FP4 tensor cores that no existing library exposes on SM120/SM121.
+No existing library exposes FP4 tensor cores as a callable API on consumer Blackwell (SM120/SM121). Not cuBLAS, not Triton, not bitsandbytes. CUTLASS Example 79a proves the hardware works, but it's a standalone demo that generates random data internally. I needed real FP4 for inference on my VLM project, so I built the missing pieces: a GPU-side BF16-to-FP4 quantization kernel, the CUTLASS interleaved scale layout engine, and a Python API that makes it a one-line call.
+
+The key feature is a **pre-quantized weight cache** - quantize weights once at model load, then every inference call only quantizes activations on the fly. This hits **85-129 TFLOPS** and is **1.4-2.4x faster than BF16 `F.linear`** at inference-relevant batch sizes, with **4x memory savings** from FP4 weights.
 
 ## Performance
 
-Benchmarked on DGX Spark GB10 (SM121, 128 GB unified LPDDR5x):
+Benchmarked on DGX Spark GB10 (SM121, 128 GB unified LPDDR5x, 273 GB/s):
 
-| Matrix Size (M x N x K) | FP4 | Float32 torch.mm | Speedup |
-|--------------------------|-----|-------------------|---------|
-| 256 x 2944 x 2944 | 0.08 ms (53 TF) | 0.33 ms (13 TF) | **4.0x** |
-| 1024 x 2944 x 2944 | 0.26 ms (67 TF) | 1.37 ms (13 TF) | **5.2x** |
-| 2048 x 2944 x 2944 | 0.34 ms (103 TF) | 2.40 ms (15 TF) | **7.0x** |
-| 4096 x 2944 x 2944 | 0.50 ms (143 TF) | 4.66 ms (15 TF) | **9.4x** |
-| 2048 x 7680 x 2944 | 0.70 ms (133 TF) | 6.05 ms (15 TF) | **8.7x** |
+| Size (M x N x K) | FP4 Cached | BF16 F.linear | Speedup | Float32 mm |
+|---|---|---|---|---|
+| 256 x 2880 x 2880 | 0.050 ms (85 TF) | 0.118 ms | **2.4x** | 0.64 ms |
+| 512 x 2880 x 2880 | 0.100 ms (85 TF) | 0.101 ms | **1.0x** | 0.85 ms |
+| 2048 x 2880 x 7680 | 0.702 ms (129 TF) | 1.190 ms | **1.7x** | 7.12 ms |
+| 2048 x 7680 x 2880 | 0.766 ms (118 TF) | 1.073 ms | **1.4x** | 6.95 ms |
+| 4096 x 2880 x 2880 | 1.089 ms (62 TF) | 0.752 ms | 0.7x | 5.12 ms |
 
-Peak: **143 TFLOPS** (including GPU-side quantization overhead). Raw GEMM kernel: **280 TFLOPS**.
+At M=4096, BF16 cuBLAS pulls ahead - the GEMM is compute-bound enough that BF16 saturates the tensor cores and FP4's activation quantization becomes overhead. At that scale, the win is **4x memory savings**, not speed.
 
-## What This Does
-
-Takes BF16 matrices on GPU, quantizes them to FP4 E2M1 with UE4M3 block scales **entirely on GPU**, then runs the CUTLASS block-scaled tensor core GEMM. One function call, no host roundtrips.
-
-```python
-from fp4_gemm import fp4_matmul, fp4_linear
-
-# Like torch.mm(A, B.T) but 5-9x faster than float32
-C = fp4_matmul(A, B)  # A: [M, K] bf16, B: [N, K] bf16 -> C: [M, N] bf16
-
-# Drop-in replacement for F.linear
-out = fp4_linear(x, weight, bias)
-```
-
-## Architecture
-
-```
-BF16 Input A [M, K]  -->  GPU Quantize Kernel  -->  FP4 packed [M, K/2] + UE4M3 scales
-BF16 Input B [N, K]  -->  GPU Quantize Kernel  -->  FP4 packed [N, K/2] + UE4M3 scales
-                                                              |
-                                                              v
-                                                    CUTLASS Block-Scaled GEMM
-                                                    (mma.sync.aligned.block_scale)
-                                                              |
-                                                              v
-                                                    BF16 Output D [M, N]
-```
-
-- **Quantization**: Per-block (16 elements) max-abs scaling. Scale = max/6.0, rounded to UE4M3.
-- **FP4 E2M1**: 4-bit float (1 sign, 2 exponent bias=1, 1 mantissa). Values: {0, +/-0.5, +/-1, +/-1.5, +/-2, +/-3, +/-4, +/-6}.
-- **UE4M3 Scale**: 8-bit unsigned float (4 exp bias=7, 3 mantissa). Range: [0.00195, 480.0].
-- **Block size**: 16 FP4 elements share 1 UE4M3 scale factor.
-- **Scale layout**: CUTLASS interleaved `SfKMajorAtom` with CuTe flat coordinate decomposition.
-
-## Requirements
-
-- NVIDIA GPU with SM120 or SM121 (RTX 5090, DGX Spark GB10, etc.)
-- CUDA Toolkit 12.8+ (12.9+ for SM121)
-- CUTLASS 3.8+ (auto-downloaded by build script)
-- Python 3.8+, PyTorch with CUDA support
+**Accuracy**: 0.991 Pearson correlation vs float32, ~1.2% mean relative error. Same NVFP4 format NVIDIA uses in ModelOpt/TensorRT-LLM.
 
 ## Quick Start
 
 ```bash
 git clone https://github.com/VincentKaufmann/fp4-cuda-kernel.git
 cd fp4-cuda-kernel
-./build.sh            # Auto-detects GPU, clones CUTLASS, builds library
+./build.sh    # auto-detects GPU arch, clones CUTLASS 3.8, compiles
 ```
 
-Then in Python:
+### Cached Mode (Inference)
+
+Quantize weights once at model load, then every forward pass only quantizes activations:
+
 ```python
-import sys; sys.path.insert(0, '/path/to/fp4-cuda-kernel')
-from fp4_gemm import fp4_matmul
-import torch
+from fp4_gemm import fp4_quantize, fp4_cached_linear
 
-A = torch.randn(2048, 2880, dtype=torch.bfloat16, device='cuda')
-B = torch.randn(2880, 2880, dtype=torch.bfloat16, device='cuda')
-C = fp4_matmul(A, B)  # 143 TFLOPS
+# One-time cost at model load (milliseconds)
+cache = fp4_quantize(weight)
+
+# Every inference call - 85-129 TFLOPS
+output = fp4_cached_linear(x, cache)
 ```
 
-### Manual Build
+### Dynamic Mode
 
-If you prefer to build manually or need a specific architecture:
+Both matrices quantized every call. Slower, but useful when both inputs change:
+
+```python
+from fp4_gemm import fp4_matmul, fp4_linear
+
+C = fp4_matmul(A, B)              # A: [M, K] bf16, B: [N, K] bf16
+out = fp4_linear(x, weight, bias)  # drop-in F.linear replacement
+```
+
+### Full API
+
+```python
+from fp4_gemm import fp4_quantize, fp4_cached_linear, FP4WeightCache
+
+# Context manager with auto-cleanup
+with FP4WeightCache(weight, bias=bias) as cache:
+    output = cache.forward(x)
+
+# Quantize all linear layers at model load
+caches = {}
+for name, param in model.named_parameters():
+    if 'weight' in name and param.dim() == 2:
+        caches[name] = fp4_quantize(param.data)
+```
+
+FP4 weights are 4x smaller than BF16. A 2880x2880 weight matrix drops from 15.8 MB to 4.0 MB. Auto-padding is handled internally.
+
+## Why This Exists
+
+I spent two days trying to get FP4 working through existing paths before writing this:
+
+| Approach | Result on SM121 |
+|----------|----------------|
+| cuBLAS FP4 | Not available (no `cublasLtMatmul` FP4 support) |
+| Triton `tl.dot_scaled` | Software fallback - 100x slower than BF16 |
+| Gluon / tcgen05 | SM121 lacks TMEM/tcgen05 (datacenter SM100 only) |
+| bitsandbytes NF4 | Software dequant, no tensor core acceleration |
+| CUTLASS Example 79a | Works! But standalone binary, not a library |
+| vLLM / TensorRT-LLM | Require full serving stack, can't just call a GEMM |
+
+Important detail most people miss: **MXFP4 weights (E2M1 + E8M0 scales) can't be used directly on SM121 tensor cores.** SM121 uses NVFP4 with UE4M3 scale factors and a specific interleaved layout (`SfKMajorAtom`). Any MXFP4 model checkpoints need re-quantization before the hardware will accept them.
+
+## How It Works
+
+```
+Cached path (inference):
+  Load time:  BF16 Weight [N, K]  ->  GPU Quantize  ->  FP4 [N, K/2] + UE4M3 scales (stored)
+  Each call:  BF16 Activation [M, K]  ->  GPU Quantize  ->  FP4 [M, K/2] + UE4M3 scales
+                                                                    |
+                                                                    v
+                                                         CUTLASS Block-Scaled GEMM
+                                                         (mma.sync.aligned.block_scale)
+                                                                    |
+                                                                    v
+                                                         BF16 Output [M, N]
+```
+
+### The Custom Pieces
+
+**GPU FP4 Quantization Kernel** - not in stock CUTLASS. One thread per 16-element block:
+1. Read 16 BF16 values, compute max absolute value
+2. Scale = max / 6.0, convert to UE4M3 (unsigned, 4 exp bias=7, 3 mantissa)
+3. Divide each value by scale, round to nearest FP4 E2M1, pack pairs into bytes
+4. Write scale to CUTLASS interleaved `SfKMajorAtom` position
+
+**Scale Factor Layout** - the hardest part. I had to reverse-engineer CuTe's flat coordinate decomposition for the interleaved layout:
+
+```
+Atom Shape:  ((32, 4), (16, 4))
+Atom Stride: ((16, 4), (0,  1))
+
+index = (row % 32) * 16 + ((row / 32) % 4) * 4
+      + (row / 128) * row_tile_stride
+      + (k_block % 4) * 1 + (k_block / 4) * k_tile_stride
+```
+
+Getting this wrong corrupts ~10% of output elements. I tried manual hierarchical coordinates first - produces different indices. The flat decomposition is the only correct path.
+
+**UE4M3 Conversion** - NVFP4 uses UE4M3 scale factors (not E8M0 like MXFP4). Full encoding/decoding with subnormal handling implemented in device code. This difference is underdocumented and cost me a full day of debugging.
+
+### CUTLASS Configuration
+
+Identical to Example 79a:
+```cpp
+using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;  // NVFP4
+using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+using TileShape = Shape<_128, _128, _128>;
+using ClusterShape = Shape<_1, _1, _1>;  // no multicast on SM121
+```
+
+## Manual Build
 
 ```bash
-# Clone CUTLASS if not present
 git clone --depth 1 --branch v3.8.0 https://github.com/NVIDIA/cutlass.git cutlass
 
-# Build (use sm_120a for RTX 5090, sm_121a for DGX Spark)
+# sm_120a for RTX 5090, sm_121a for DGX Spark
 nvcc -arch=sm_121a -shared -Xcompiler -fPIC -O2 --expt-relaxed-constexpr \
   -I cutlass/include -I cutlass/tools/util/include -I cutlass/examples/common \
   -o libfp4gemm.so fp4_gemm_lib.cu
 ```
 
-## How It Works - Key Technical Details
+## Requirements
 
-### The CUTLASS Configuration
-
-This wraps CUTLASS Example 79a with identical kernel configuration:
-
-```cpp
-using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;  // NVFP4
-using LayoutA  = cutlass::layout::RowMajor;                     // A is row-major
-using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;  // NVFP4
-using LayoutB  = cutlass::layout::ColumnMajor;                  // B is column-major
-using TileShape = Shape<_128, _128, _128>;                      // Threadblock tile
-using ClusterShape = Shape<_1, _1, _1>;                         // No multicast (SM121)
-```
-
-### Scale Factor Layout
-
-The scale factors use CUTLASS's interleaved `SfKMajorAtom`:
-```
-Shape:  ((32, 4), (SFVecSize, 4))
-Stride: ((16, 4), (0,         1))
-```
-
-The K-inner dimension (SFVecSize=16) has stride 0 (broadcast - all 16 elements share one scale). The layout is tiled across the full matrix via `tile_to_shape`.
-
-**Critical finding**: CuTe's flat coordinate decomposition (`layout(row, k, 0)`) handles the interleaved indexing correctly. Manual hierarchical coordinate computation produces **wrong indices** and corrupts ~10% of output elements.
-
-### GPU Quantization Kernel
-
-One CUDA thread per 16-element scale block:
-1. Read 16 BF16 values from source matrix
-2. Compute max absolute value -> UE4M3 scale factor
-3. Divide each value by scale, round to nearest FP4 E2M1
-4. Pack 2 FP4 values per byte (low nibble = even index)
-5. Write scale to CUTLASS interleaved layout position
+- NVIDIA GPU with SM120 or SM121 (RTX 5090/5080, DGX Spark GB10)
+- CUDA Toolkit 12.8+ (12.9+ for SM121)
+- CUTLASS 3.8+ (auto-downloaded by `build.sh`)
+- Python 3.8+, PyTorch with CUDA
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `fp4_gemm_lib.cu` | CUDA source - CUTLASS GEMM + GPU quantization kernels |
-| `fp4_gemm.py` | Python ctypes wrapper with auto-padding and batching |
-| `build.sh` | Build script - auto-detects GPU, clones CUTLASS, compiles |
+| `fp4_gemm_lib.cu` | CUDA kernel - CUTLASS GEMM + GPU quantization + cached weight API |
+| `fp4_gemm.py` | Python wrapper - dynamic, cached, auto-padding, batching, context managers |
+| `build.sh` | Build script - auto-detects GPU arch, clones CUTLASS, compiles |
 
 ## Limitations
 
-- Dimensions must be multiples of 128 (auto-padded in Python API)
-- Quantization happens every call (no cached FP4 weights yet)
-- No gradient support (forward-only, suitable for inference and frozen-weight training)
-- SM120/SM121 only (no SM100 support - different instruction set)
+- Dimensions auto-padded to multiples of 128 (transparent in Python API)
+- Forward-only, no gradient support (inference and frozen-weight training)
+- SM120/SM121 only (SM100 datacenter Blackwell uses a different instruction set)
+- At large M (4096+), BF16 cuBLAS is faster in wall-clock - FP4 still wins on memory
 
 ## Citation
-
-If you find this useful, please cite:
 
 ```
 @software{fp4_cuda_kernel,
